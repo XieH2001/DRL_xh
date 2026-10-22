@@ -4,7 +4,7 @@ import argparse
 import sys
 from functools import partial
 from pathlib import Path
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,16 +25,17 @@ from agent.training_utils import (  # noqa: E402
     collect_metrics,
     init_base_env as _init_base_env,
     initialize_episode_resources as _initialize_episode_resources,
+    is_result_candidate,
     layer_init,
     load_orders as _load_orders,
     make_episode_env,
     make_visdom as _make_visdom,
     max_decisions,
-    output_paths as _output_paths,
     print_episode,
-    save_checkpoint,
+    repo_path,
     set_seed,
     step_env,
+    use_deterministic_action,
     write_best_config_csv,
 )
 
@@ -61,15 +62,22 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         output_dir=paths["baseline_output_dir"],
         visdom=experiment["visdom"],
         action_scale=experiment["action_scale"],
+        long_robot_center=experiment["long_robot_center"],
+        long_picker_center=experiment["long_picker_center"],
+        long_robot_max=experiment["long_robot_max"],
+        long_picker_max=experiment["long_picker_max"],
+        deterministic_tail_fraction=experiment["deterministic_tail_fraction"],
         max_days=experiment["max_days"],
         device=resolve_device(experiment["device"]),
     )
     return parser
 
 
-def output_paths(args: argparse.Namespace, algorithm: str) -> tuple[Path, Path]:
+def output_path(args: argparse.Namespace, algorithm: str) -> Path:
     stem = f"{algorithm}_{case_stem(args.mode, args.items, args.month, args.seed)}"
-    return _output_paths(args.output_dir, stem)
+    output_dir = repo_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{stem}.csv"
 
 
 def best_config_path(args: argparse.Namespace, algorithm: str) -> Path:
@@ -117,6 +125,29 @@ def state_to_arrays(state: dict) -> tuple[np.ndarray, np.ndarray]:
         axis=0,
     ).astype(np.float32)
     scalar = np.asarray([state["n_robots"]] + list(state["n_pickers_area"]), dtype=np.float32)
+    warehouse = DEFAULT_PARAMETERS["warehouse"]
+    order = DEFAULT_PARAMETERS["order"]
+    pick_points_total = max(
+        1,
+        int(warehouse["area_num"])
+        * int(warehouse["aisle_num"])
+        * int(warehouse["shelf_capacity"]),
+    )
+    pick_points_per_area = max(
+        1,
+        int(warehouse["aisle_num"]) * int(warehouse["shelf_capacity"]),
+    )
+    max_order_items = max(1, int(max(order["order_n_items"])))
+    matrix_scale = np.asarray(
+        [pick_points_total, 1.0, max_order_items],
+        dtype=np.float32,
+    ).reshape(3, 1, 1)
+    scalar_scale = np.asarray(
+        [pick_points_total] + [pick_points_per_area] * int(warehouse["area_num"]),
+        dtype=np.float32,
+    )
+    matrix = matrix / matrix_scale
+    scalar = scalar / scalar_scale
     return matrix, scalar
 
 
@@ -128,10 +159,171 @@ def state_to_tensors(state: dict, device: torch.device) -> tuple[torch.Tensor, t
     )
 
 
-def normalized_to_env_action(action: np.ndarray, action_scale: int) -> np.ndarray:
-    clipped = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+# Keeps artanh finite when a squashed action is exactly +/-1 (clipped noise, float saturation).
+_ARTANH_EDGE = 1e-12
+
+
+def normalized_to_env_action(
+    action: np.ndarray,
+    action_scale: int,
+    mode: str = "short",
+    decision_index: int = 0,
+    long_robot_center: float = 8.0,
+    long_picker_center: float = 3.0,
+) -> np.ndarray:
+    """Map a squashed continuous action in [-1, 1] to the environment's integer action.
+
+    Long-term absolute decisions (long mode, and the first hybrid decision) use the
+    uncapped map n = c + (c - 1) * artanh(a): a = 0 gives the centre c, a -> 1 grows
+    without bound, and the environment's minimum of one unit is the only limit.  Near
+    a = 0 it has the same value and slope as the former bounded map onto [1, 2c - 1],
+    so it only differs where that map used to saturate.  This matches PPO, whose
+    Gaussian action is applied to the environment without an upper bound.
+    """
+    clipped = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+    absolute_long_action = mode == "long" or (mode == "hybrid" and decision_index == 0)
+    if absolute_long_action:
+        if long_robot_center <= 1 or long_picker_center <= 1:
+            raise ValueError("long-term resource centres must be greater than 1")
+        centers = np.asarray(
+            [long_robot_center] + [long_picker_center] * (len(clipped) - 1),
+            dtype=np.float64,
+        )
+        latent = np.arctanh(np.clip(clipped, -1.0 + _ARTANH_EDGE, 1.0 - _ARTANH_EDGE))
+        counts = centers + (centers - 1.0) * latent
+        return np.maximum(1.0, np.rint(counts)).astype(np.float32)
     scaled = np.rint(clipped * action_scale)
     return np.clip(scaled, -action_scale, action_scale).astype(np.float32)
+
+
+def discrete_action_cardinalities(
+    mode: str,
+    decision_index: int,
+    action_dim: int,
+    action_scale: int,
+    long_robot_max: int,
+    long_picker_max: int,
+) -> np.ndarray:
+    """Return the number of valid discrete choices for every action branch.
+
+    A discrete Q-network needs a finite action set, so DQN and DDQN keep a finite grid
+    of 1..long_robot_max robots and 1..long_picker_max pickers per zone for long-term
+    absolute decisions.  The continuous baselines and PPO have no such cap.
+    """
+    if action_dim < 1:
+        raise ValueError("action_dim must be positive")
+    if action_scale < 1:
+        raise ValueError("action_scale must be positive")
+    if long_robot_max < 1 or long_picker_max < 1:
+        raise ValueError("long-term resource limits must be positive")
+
+    absolute_long_action = mode == "long" or (mode == "hybrid" and decision_index == 0)
+    if absolute_long_action:
+        return np.asarray(
+            [long_robot_max] + [long_picker_max] * (action_dim - 1),
+            dtype=np.int64,
+        )
+    return np.full(action_dim, 2 * action_scale + 1, dtype=np.int64)
+
+
+def max_discrete_action_cardinalities(
+    mode: str,
+    action_dim: int,
+    action_scale: int,
+    long_robot_max: int,
+    long_picker_max: int,
+) -> np.ndarray:
+    """Return fixed network head sizes that cover every decision in a mode."""
+    first = discrete_action_cardinalities(
+        mode,
+        0,
+        action_dim,
+        action_scale,
+        long_robot_max,
+        long_picker_max,
+    )
+    if mode != "hybrid":
+        return first
+    later = discrete_action_cardinalities(
+        mode,
+        1,
+        action_dim,
+        action_scale,
+        long_robot_max,
+        long_picker_max,
+    )
+    return np.maximum(first, later)
+
+
+def discrete_indices_to_env_action(
+    action_indices: np.ndarray,
+    mode: str,
+    decision_index: int,
+    action_scale: int,
+    long_robot_max: int,
+    long_picker_max: int,
+) -> np.ndarray:
+    """Map a multi-discrete DQN action to the warehouse integer action."""
+    indices = np.asarray(action_indices, dtype=np.int64).reshape(-1)
+    cardinalities = discrete_action_cardinalities(
+        mode,
+        decision_index,
+        len(indices),
+        action_scale,
+        long_robot_max,
+        long_picker_max,
+    )
+    if np.any(indices < 0) or np.any(indices >= cardinalities):
+        raise ValueError("action index is outside the valid range for this decision")
+
+    absolute_long_action = mode == "long" or (mode == "hybrid" and decision_index == 0)
+    if absolute_long_action:
+        return (indices + 1).astype(np.float32)
+    return (indices - action_scale).astype(np.float32)
+
+
+def use_random_action(global_step: int, learning_starts: int) -> bool:
+    if learning_starts < 0:
+        raise ValueError("learning_starts must be non-negative")
+    return global_step < learning_starts
+
+
+def linear_exploration_scale(
+    global_step: int,
+    total_steps: int,
+    initial_scale: float,
+    final_scale: float,
+    decay_fraction: float,
+) -> float:
+    if not 0 < decay_fraction <= 1:
+        raise ValueError("exploration_decay_fraction must be in (0, 1]")
+    decay_steps = max(1, int(total_steps * decay_fraction))
+    progress = min(max(global_step, 0) / decay_steps, 1.0)
+    return float(initial_scale + progress * (final_scale - initial_scale))
+
+
+class RunningRewardNormalizer:
+    def __init__(self, epsilon: float = 1e-8):
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.epsilon = epsilon
+
+    def update(self, reward: float) -> None:
+        self.count += 1
+        delta = reward - self.mean
+        self.mean += delta / self.count
+        delta2 = reward - self.mean
+        self.m2 += delta * delta2
+
+    @property
+    def std(self) -> float:
+        if self.count < 2:
+            return 1.0
+        return max(float(np.sqrt(self.m2 / self.count)), self.epsilon)
+
+    def normalize(self, rewards: torch.Tensor) -> torch.Tensor:
+        return (rewards - self.mean) / self.std
 
 
 class StateEncoder(nn.Module):
@@ -251,6 +443,31 @@ class QNetwork(nn.Module):
         return self.q(torch.cat([hidden, action], dim=-1))
 
 
+class BranchingQNetwork(nn.Module):
+    """Factorized Q network for the warehouse's multi-discrete action vector."""
+
+    def __init__(
+        self,
+        input_height: int,
+        input_width: int,
+        scalar_dim: int,
+        branch_sizes: Sequence[int],
+    ):
+        super().__init__()
+        self.encoder = StateEncoder(input_height, input_width, scalar_dim)
+        self.heads = nn.ModuleList(
+            [layer_init(nn.Linear(128, int(size)), std=1.0) for size in branch_sizes]
+        )
+
+    def forward(
+        self,
+        matrix: torch.Tensor,
+        scalar: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        hidden = self.encoder(matrix, scalar)
+        return tuple(head(hidden) for head in self.heads)
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int, matrix_shape: Tuple[int, ...], scalar_dim: int, action_dim: int):
         self.capacity = capacity
@@ -284,15 +501,81 @@ class ReplayBuffer:
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int, device: torch.device):
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+        reward_normalizer: RunningRewardNormalizer | None = None,
+    ):
         idx = np.random.randint(0, self.size, size=batch_size)
+        rewards = torch.as_tensor(self.reward[idx], dtype=torch.float32, device=device)
+        if reward_normalizer is not None:
+            rewards = reward_normalizer.normalize(rewards)
         return (
             torch.as_tensor(self.matrix[idx], dtype=torch.float32, device=device),
             torch.as_tensor(self.scalar[idx], dtype=torch.float32, device=device),
             torch.as_tensor(self.action[idx], dtype=torch.float32, device=device),
-            torch.as_tensor(self.reward[idx], dtype=torch.float32, device=device),
+            rewards,
             torch.as_tensor(self.next_matrix[idx], dtype=torch.float32, device=device),
             torch.as_tensor(self.next_scalar[idx], dtype=torch.float32, device=device),
+            torch.as_tensor(self.done[idx], dtype=torch.float32, device=device),
+        )
+
+
+class DiscreteReplayBuffer:
+    def __init__(self, capacity: int, matrix_shape: Tuple[int, ...], scalar_dim: int, action_dim: int):
+        self.capacity = capacity
+        self.ptr = 0
+        self.size = 0
+        self.matrix = np.zeros((capacity, *matrix_shape), dtype=np.float32)
+        self.scalar = np.zeros((capacity, scalar_dim), dtype=np.float32)
+        self.action = np.zeros((capacity, action_dim), dtype=np.int64)
+        self.reward = np.zeros((capacity, 1), dtype=np.float32)
+        self.next_matrix = np.zeros((capacity, *matrix_shape), dtype=np.float32)
+        self.next_scalar = np.zeros((capacity, scalar_dim), dtype=np.float32)
+        self.next_cardinalities = np.ones((capacity, action_dim), dtype=np.int64)
+        self.done = np.zeros((capacity, 1), dtype=np.float32)
+
+    def add(
+        self,
+        matrix: np.ndarray,
+        scalar: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        next_matrix: np.ndarray,
+        next_scalar: np.ndarray,
+        next_cardinalities: np.ndarray,
+        done: bool,
+    ) -> None:
+        self.matrix[self.ptr] = matrix
+        self.scalar[self.ptr] = scalar
+        self.action[self.ptr] = action
+        self.reward[self.ptr] = reward
+        self.next_matrix[self.ptr] = next_matrix
+        self.next_scalar[self.ptr] = next_scalar
+        self.next_cardinalities[self.ptr] = next_cardinalities
+        self.done[self.ptr] = float(done)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+        reward_normalizer: RunningRewardNormalizer | None = None,
+    ):
+        idx = np.random.randint(0, self.size, size=batch_size)
+        rewards = torch.as_tensor(self.reward[idx], dtype=torch.float32, device=device)
+        if reward_normalizer is not None:
+            rewards = reward_normalizer.normalize(rewards)
+        return (
+            torch.as_tensor(self.matrix[idx], dtype=torch.float32, device=device),
+            torch.as_tensor(self.scalar[idx], dtype=torch.float32, device=device),
+            torch.as_tensor(self.action[idx], dtype=torch.long, device=device),
+            rewards,
+            torch.as_tensor(self.next_matrix[idx], dtype=torch.float32, device=device),
+            torch.as_tensor(self.next_scalar[idx], dtype=torch.float32, device=device),
+            torch.as_tensor(self.next_cardinalities[idx], dtype=torch.long, device=device),
             torch.as_tensor(self.done[idx], dtype=torch.float32, device=device),
         )
 

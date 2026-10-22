@@ -2,7 +2,7 @@
 
 Paper Title: **The Impact of Dynamic Workforce Allocation in Human-Robot Collaborative Warehouses: A Human-Centric Perspective**
 
-本项目用于研究人机协同仓库中的动态资源配置问题，包含统一配置、订单算例生成、PPO 训练入口，以及 A2C / DDPG / TD3 / SAC 对比算法。
+本项目用于研究人机协同仓库中的动态资源配置问题，包含统一配置、订单算例生成、PPO 训练入口，以及 A2C / DDPG / TD3 / SAC / DQN / DDQN 对比算法。
 
 ## Configuration
 
@@ -25,7 +25,7 @@ DRL_Warehouse/
 │   └── fixed_hybrid_batch.json       # fixed_hybrid 批量训练的逐月长租参数
 ├── agent/
 │   ├── ppo/                          # PPO 训练入口与网络
-│   └── baselines/                    # A2C / DDPG / TD3 / SAC 对比算法
+│   └── baselines/                    # A2C / DDPG / TD3 / SAC / DQN / DDQN
 ├── data/
 │   ├── generate_orders.py            # 订单算例生成入口
 │   └── instances/                    # items_<n>/orders_m<month>.pkl
@@ -68,6 +68,12 @@ data/instances/items_10/orders_m01.pkl ... orders_m12.pkl
 python -m agent.ppo.train
 ```
 
+PPO 与 baseline 使用同一套结果选取规则（`experiment.deterministic_tail_fraction`，默认 0.1）：
+
+- 最后 10% episode（1000 个 episode 时为第 901~1000 个）直接使用策略均值动作，不写入 buffer，也不更新参数。
+- `_best_config.csv` 和 `.pth` checkpoint 只从这段确定性尾段中选择成本最低的 episode。
+- 将 `deterministic_tail_fraction` 设为 0 时，全部 episode 都参与训练和选取，即旧版 PPO 的行为。
+
 ## Train Baselines
 
 baseline 的训练模式、算例、episode、seed、输出目录和设备同样来自 `configs/default.json`。各算法独有超参数仍可通过 CLI 调整：
@@ -78,7 +84,23 @@ python agent\baselines\a2c.py --lr 0.0003
 python agent\baselines\ddpg.py --actor-lr 0.0001 --critic-lr 0.001
 python agent\baselines\td3.py --policy-delay 2
 python agent\baselines\sac.py --alpha-lr 0.0003
+python agent\baselines\dqn.py --learning-rate 0.0003
+python agent\baselines\ddqn.py --target-update-interval 100
 ```
+
+六个对比算法（A2C / DDPG / TD3 / SAC / DQN / DDQN）使用与 PPO 相同的状态归一化尺度，但不会修改或覆盖 PPO 实现及其已有结果。长租模式的主要训练规则如下：
+
+- A2C 跨 64 个单步 episode 累积一个更新批次，避免单样本 advantage 归零。
+- DDPG / TD3 / SAC / DQN / DDQN 在 64 个 transition 后结束纯随机探索阶段，第 65 个长租 episode 起使用已学习策略并按各算法的探索规则继续采样。
+- DQN / DDQN 使用多离散分支 Q 网络，分别选择机器人和各区域拣货员动作，避免枚举全部联合动作；DDQN 使用在线网络选取下一动作、目标网络评估该动作。
+- long 模式和 hybrid 第一次决策的动作表示绝对资源数，与 PPO 一样不设上限，下限 1 由环境保证：
+  - A2C / DDPG / TD3 / SAC 将压缩到 [-1, 1] 的动作 a 映射为 n = c + (c-1)·artanh(a)。中心 c 为 `long_robot_center`（8）和 `long_picker_center`（3），a = 0 时的取值和斜率与旧版 1~15 / 1~5 映射相同，但不再饱和。
+  - DQN / DDQN 的离散 Q 网络必须使用有限动作集，仍按 `long_robot_max`（15）和 `long_picker_max`（5）构造 1~15 台机器人、每区 1~5 名拣货员的离散网格。
+- 最后 10% episode 关闭探索并冻结参数更新，训练 CSV 尾段直接反映最终确定性策略；PPO 使用同一规则。
+- baseline 不执行独立评估，也不保存模型 checkpoint；结果来自逐 episode CSV 和训练过程生成的 `_best_config.csv`。
+- `_best_config.csv` 只从最后 10% 的确定性收敛段中选择，不使用前期随机探索的偶然最小成本；PPO 同样如此。
+
+`--learning-starts` 可调整 DDPG / TD3 / SAC / DQN / DDQN 的纯随机探索 transition 数；旧参数名 `--warmup-steps` 作为兼容别名继续可用。
 
 ## Modes
 
@@ -89,6 +111,10 @@ short | long | hybrid | fixed_hybrid
 ```
 
 `fixed_hybrid` 模式下，第一天按 `experiment.fixed_hybrid.long_term_robots` 和 `experiment.fixed_hybrid.long_term_pickers_area` 创建固定长租资源，后续天数由算法调整短租资源。
+
+## Simulation Rules
+
+机器人在出发时（领取订单时、或在当前拣货位拣完后）按路由规则确定下一个拣货位，并按该拣货位计算行驶时间；到达时直接进入这个拣货位，不会按到达时刻的队列等状态重新选择。
 
 ## Batch Training
 
@@ -168,11 +194,14 @@ python -m agent.baselines.train_batch --algorithm td3 --mode hybrid --months 9 -
 
 # SAC fixed_hybrid 模式，预览
 python -m agent.baselines.train_batch --algorithm sac --mode fixed_hybrid --dry-run
+
+# DDQN long 模式，全部 12 个月
+python -m agent.baselines.train_batch --algorithm ddqn --mode long
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--algorithm` | **必填** | 算法名：`ddpg` / `td3` / `sac` / `a2c` |
+| `--algorithm` | **必填** | 算法名：`a2c` / `ddpg` / `td3` / `sac` / `dqn` / `ddqn` |
 | `--mode` | **必填** | 训练模式：`short` / `long` / `hybrid` / `fixed_hybrid` |
 | `--months` | `1,2,...,12` | 逗号分隔的月份列表 |
 | `--episodes` | 配置文件中的值 | 覆盖训练 episode 数 |
@@ -197,9 +226,11 @@ python -m agent.baselines.train_batch --algorithm sac --mode fixed_hybrid --dry-
 - Baselines: `result/baselines/<algorithm>_<mode>_i<items>_m<month>_seed<seed>.csv`
 - Baseline best resource configuration: `result/baselines/<algorithm>_<mode>_i<items>_m<month>_seed<seed>_best_config.csv`
 
+批量运行 baseline 时，月份 `m` 使用 `experiment.seed + m - 1` 作为训练 seed；五个 off-policy 算法和 A2C 在同一月份仍使用相同 seed，保证横向比较可复现。
+
 ## Tests
 
 ```powershell
-python -m py_compile environment\class_public.py environment\class_warehouse.py environment\warehouse_env.py data\generate_orders.py agent\training_utils.py agent\ppo\train.py agent\baselines\common.py
+python -m py_compile environment\class_public.py environment\class_warehouse.py environment\warehouse_env.py data\generate_orders.py agent\training_utils.py agent\ppo\train.py agent\baselines\common.py agent\baselines\dqn.py agent\baselines\ddqn.py agent\baselines\train_batch.py
 python -m unittest discover -s test -p "test_*.py"
 ```
